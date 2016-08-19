@@ -15,7 +15,7 @@ import dateutil.parser
 
 class SmartYeelight(object):
 
-    def __init__(self, apply_light_policy_interval = 10, device_detection_interval = 10, device_offline_delay = 10, debug = False):
+    def __init__(self, apply_light_policy_interval = 10, device_detection_interval = 10, device_offline_delay = 10, logging_level = logging.INFO):
         self.__yeelight_detection_thread = None
         self.__device_detection_thread = None
         self.__device_detection_thread_woker = {}
@@ -30,14 +30,15 @@ class SmartYeelight(object):
         self.__device_offline_delay = device_offline_delay
         self.__RUNNING = False
         # a few setups
-        self.__setup_log()
+        self.__setup_log(logging_level)
         signal.signal(signal.SIGINT, self.__signal_handler)
         signal.signal(signal.SIGTERM, self.__signal_handler)
         signal.signal(signal.SIGUSR1, self.__signal_handler)
+        self.__logger.info("Controller instance created")
 
-    def __setup_log(self):
+    def __setup_log(self, logging_level = logging.INFO):
         logger = logging.getLogger("SmartYeelightCtrl")
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging_level)
         # create the logging file handler
         fh = logging.FileHandler("smart-yeelight-controller.log")
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -387,7 +388,7 @@ if __name__ == "__main__":
             ]
         }
     ]
-    light = SmartYeelight(debug = True)
+    light = SmartYeelight(logging_level = logging.INFO)
     light.deploy_policy(light_policy)
     light.start()
     while light.is_running():
