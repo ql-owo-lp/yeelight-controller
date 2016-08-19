@@ -4,9 +4,9 @@ from YeelightWifiBulbLanCtrl import *
 import json
 import urllib2
 import math
-import os
+import sys, os
 import signal
-import logging
+import logging, logging.handlers
 from collections import Counter
 # sudo apt-get install python-dateutil
 from datetime import date, datetime
@@ -28,40 +28,61 @@ class SmartYeelight(object):
         self.__device_detection_interval = device_detection_interval
         self.__apply_light_policy_interval = apply_light_policy_interval
         self.__device_offline_delay = device_offline_delay
+        self.__config = {}
         self.__RUNNING = False
         # a few setups
-        self.__setup_log(logging_level)
-        signal.signal(signal.SIGINT, self.__signal_handler)
-        signal.signal(signal.SIGTERM, self.__signal_handler)
-        signal.signal(signal.SIGUSR1, self.__signal_handler)
+        self.register_signal_handler()
+        self.__setup_log(logging_level = logging_level)
         self.__logger.info("Controller instance created")
 
-    def __setup_log(self, logging_level = logging.INFO):
-        logger = logging.getLogger("SmartYeelightCtrl")
-        logger.setLevel(logging_level)
-        # create the logging file handler
-        fh = logging.FileHandler("smart-yeelight-controller.log")
+    def __setup_log(self, log_file = None, logging_level = None):
+        rootLogger = logging.getLogger("SmartYeelightCtrl")
+        if logging_level is None:
+            logging_level = logging.INFO
+        rootLogger.setLevel(logging_level)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        fh.setFormatter(formatter)
-        # add handler to logger object
-        logger.addHandler(fh)
-        self.__logger = logger
+        # create the logging file handler
+        if log_file is not None:
+            fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=1024 * 1024 * 5, backupCount=5)
+            fh.setFormatter(formatter)
+            rootLogger.addHandler(fh)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(formatter)
+        rootLogger.addHandler(ch)
+        self.__logger = rootLogger
 
     def deploy_policy(self, light_policy):
         self.__get_compiled_policy(light_policy)
+        self.__logger.info("New policy loaded: %s", self.__compiled_policy)
 
-    def __start_yeelight(self):
+    def load_config_file(self, config_file):
+        with open(config_file, encoding='utf-8') as data_file:
+            self.__logger.info("Reading config from file %s", config_file)
+            config = json.load(data_file)
+            self.load_config(config)
+
+    def load_config(self, config):
+        if config['log']:
+            self.__setup_log(log_file = config['log']['log_file'], logging_level = config['log']['logging_level'])
+        if data['policy']:
+            self.deploy_policy(config['policy'])
+        self.__logger.info("Config loaded: %s", config)
+        self.__config = config
+
+    def __start_yeelight(self, daemon = False):
         if self.__yeelight_detection_thread is None:
             RUNNING = True
             self.__yeelight_detection_thread = Thread(target = bulbs_detection_loop)
-            self.__yeelight_detection_thread.setDaemon(True)
+            self.__yeelight_detection_thread.setDaemon(daemon)
             self.__yeelight_detection_thread.start()
 
     def __stop_yeelight(self):
+        self.__logger.debug("Stopping yeelight worker thread..")
         if self.__yeelight_detection_thread is not None:
             RUNNING = False
-            self.__yeelight_detection_thread.join()
+            self.__yeelight_detection_thread.join(1)
             self.__yeelight_detection_thread = None
+            self.__logger.debug("Yeelight worker thread stopped")
 
     def __register_device_for_monitor(self, device_list = []):
         for device_ip in device_list:
@@ -85,9 +106,10 @@ class SmartYeelight(object):
             sleep(self.__device_detection_interval)
 
     def __detect_device_worker(self, ip):
+        self.__logger.debug("Detecting if device %s is online..", ip)
         retry = self.__device_offline_delay
         device_is_online = False
-        while not device_is_online and retry > 0:
+        while self.__device_detection_thread is not None and not device_is_online and retry > 0:
             retry -= 1
             device_is_online = (os.system("ping -c 1 "+ ip +" > /dev/null 2>&1") == 0)
             if device_is_online:
@@ -103,23 +125,29 @@ class SmartYeelight(object):
             self.__logger.info('Device gets offline: %s', ip)
         self.__device_detection_thread_woker.pop(ip, None)
 
-    def __start_detect_device(self):
+    def __start_detect_device(self, daemon = False):
         if self.__device_detection_thread is None:
             self.__device_detection_thread = Thread(target = self.__detect_device_loop)
-            self.__device_detection_thread.setDaemon(True)
+            self.__device_detection_thread.setDaemon(daemon)
             self.__device_detection_thread.start()
 
     def __stop_detect_device(self):
+        self.__logger.debug("Stopping device detection thread..")
         if self.__device_detection_thread is not None:
             thread = self.__device_detection_thread
             # set thread to None so that the loop can exit
             self.__device_detection_thread = None
-            thread.join()
+            thread.join(1)
+            self.__logger.debug("Device detection thread stopped")
 
     def __stop_detect_device_worker(self):
-        for device_ip, worker in self.__device_detection_thread_woker:
-            worker.cancel()
-        self.__device_detection_thread_woker = {}
+        if self.__device_detection_thread_woker:
+            self.__logger.debug("Stopping device detection worker thread..")
+        for ip in self.__device_detection_thread_woker:
+            self.__logger.debug("Stopping device detection worker thread for %s..", ip)
+            self.__device_detection_thread_woker[ip].join(1)
+        self.__device_detection_thread_woker.clear()
+        self.__logger.debug("Device detection worker thread stopped")
 
     def __apply_light_policy_loop(self):
         while self.__apply_light_policy_thread is not None:
@@ -129,20 +157,26 @@ class SmartYeelight(object):
     def __apply_light_policy(self):
         # recalculate light brightness
         calculated_light_brigtness = self.calculate_light_brightness()
-        self.change_yeelight_brightness(calculated_light_brigtness)
+        change_applied = self.change_yeelight_brightness(calculated_light_brigtness)
+        if change_applied:
+            # if a change is a applied, we want to refresh the light status
+            # sometimes passively listening for light status change doesn't work
+            send_search_broadcast()
 
-    def __start_apply_light_policy(self):
+    def __start_apply_light_policy(self, daemon = False):
         if self.__apply_light_policy_thread is None:
             self.__apply_light_policy_thread = Thread(target = self.__apply_light_policy_loop)
-            self.__apply_light_policy_thread.setDaemon(True)
+            self.__apply_light_policy_thread.setDaemon(daemon)
             self.__apply_light_policy_thread.start()
 
     def __stop_apply_light_policy(self):
+        self.__logger.debug("Stopping light policy executor thread..")
         if self.__apply_light_policy_thread is not None:
             thread = self.__apply_light_policy_thread
             # set thread to None so that the loop can exit
             self.__apply_light_policy_thread = None
-            thread.join()
+            thread.join(1)
+            self.__logger.debug("Light policy executor thread stopped")
 
     def __get_overlap_between_lists(self, list1, list2):
         l1_multiset = Counter(list1)
@@ -156,27 +190,40 @@ class SmartYeelight(object):
         else:
             return False
 
-    def start(self):
+    def start(self, daemon = False):
         self.__logger.debug("Controller started")
-        self.__start_yeelight()
-        self.__start_detect_device()
-        self.__start_apply_light_policy()
+        self.__start_yeelight(daemon = daemon)
+        self.__start_detect_device(daemon = daemon)
+        self.__start_apply_light_policy(daemon = daemon)
         self.__RUNNING = True
 
-    def stop(self):
-        self.__logger.debug("Controller stopped")
+    def stop(self, terminate_process = False):
+        self.__logger.debug("Stopping Controller..")
         self.__RUNNING = False
         self.__stop_apply_light_policy()
         self.__stop_detect_device()
         self.__stop_detect_device_worker()
         self.__stop_yeelight()
+        self.__logger.debug("Controller stopped")
+        if terminate_process:
+            try:
+                sys.exit(0)
+            except SystemExit:
+                os._exit(0)
 
     def is_running(self):
         return self.__RUNNING
 
+    def register_signal_handler(self):
+        signal.signal(signal.SIGTSTP, self.__signal_handler)
+        signal.signal(signal.SIGINT, self.__signal_handler)
+        signal.signal(signal.SIGTERM, self.__signal_handler)
+        signal.signal(signal.SIGUSR1, self.__signal_handler)
+
     def __signal_handler(self, signal, frame):
-        self.stop()
-        os._exit(0)
+        self.__logger.info("Terminate signal captured: %s. Stopping controller threads..", signal)
+        self.stop(terminate_process = True)
+        self.__logger.info("All threads stopped")
 
     def __http_get(self, url, timeout = 3):
         try:
@@ -323,11 +370,15 @@ class SmartYeelight(object):
         return t
 
     def change_yeelight_brightness(self, bulb_policy = []):
+        change_applied = False
         for policy in bulb_policy:
-            self.__change_yeelight_brightness(policy)
+            if self.__change_yeelight_brightness(policy):
+                change_applied = True
+        return change_applied
 
     def __change_yeelight_brightness(self, bulb_policy):
         bulb_ip_list, target_bulb_brightness = bulb_policy["bulb_ip"], bulb_policy["calculated_brightness"]
+        change_applied = False
         for bulb_ip in bulb_ip_list:
             if bulb_ip not in detected_bulbs:
                 self.__logger.warning("Bulb %s is offline.", bulb_ip)
@@ -340,13 +391,17 @@ class SmartYeelight(object):
                 if bulb_power == 'off': # turn on light
                     self.__logger.debug("Turn on yeelight %s", bulb_ip)
                     toggle_bulb(bulb_id)
+                    change_applied = True
                 if bulb_bright != target_bulb_brightness:
                     self.__logger.info('Set yeelight %s to brightness %s', bulb_ip, target_bulb_brightness)
                     set_bright(bulb_id, target_bulb_brightness)
+                    change_applied = True
             elif target_bulb_brightness == 0:
                 if bulb_power == 'on': # turn off light
                     self.__logger.info("Turn yeelight %s off.", bulb_ip)
                     toggle_bulb(bulb_id)
+                    change_applied = True
+        return change_applied
 
 
 if __name__ == "__main__":
@@ -390,10 +445,10 @@ if __name__ == "__main__":
     ]
     light = SmartYeelight(logging_level = logging.INFO)
     light.deploy_policy(light_policy)
-    light.start()
-    while light.is_running():
+    light.start(daemon = True)
+    while True:
         try:
-            sleep(99999)
-        except:
-            light.stop()
+            sleep(9999)
+        except KeyboardInterrupt:
+            light.stop(terminate_process = True)
 
