@@ -52,7 +52,6 @@ class SmartYeelight(object):
         self.__logger = rootLogger
 
     def deploy_policy(self, light_policy):
-        self.__get_compiled_policy(light_policy)
         self.__logger.info("New policy loaded: %s", self.__compiled_policy)
 
     def load_config_file(self, config_file):
@@ -106,24 +105,25 @@ class SmartYeelight(object):
             sleep(self.__device_detection_interval)
 
     def __detect_device_worker(self, ip):
-        self.__logger.debug("Detecting if device %s is online..", ip)
-        retry = self.__device_offline_delay
-        device_is_online = False
-        while self.__device_detection_thread is not None and not device_is_online and retry > 0:
-            retry -= 1
-            device_is_online = (os.system("ping -c 1 "+ ip +" > /dev/null 2>&1") == 0)
-            if device_is_online:
+        while ip in self.__device_detection_thread_woker:
+            self.__logger.debug("Detecting if device %s is online..", ip)
+            retry = self.__device_offline_delay
+            device_is_online = False
+            while not device_is_online and retry > 0:
+                retry -= 1
+                device_is_online = (os.system("ping -c 1 "+ ip +" > /dev/null 2>&1") == 0)
                 if ip not in self.__device_online:
-                    self.__device_online.append(ip)
-                    self.__logger.info('Device gets online: %s', ip)
-                break
-            if retry > 0:
-                self.__logger.debug('Device %s is going to be offline in %s retries.', ip, retry)
-            sleep(0.2)
-        if not device_is_online and ip in self.__device_online:
-            self.__device_online.remove(ip)
-            self.__logger.info('Device gets offline: %s', ip)
-        self.__device_detection_thread_woker.pop(ip, None)
+                    if device_is_online:
+                        self.__device_online.append(ip)
+                        self.__logger.info('Device is online: %s', ip)
+                        break
+                    if retry > 0:
+                        self.__logger.debug('Device %s is going to be offline in %s retries.', ip, retry)
+                sleep(0.2)
+            if not device_is_online and ip in self.__device_online:
+                self.__device_online.remove(ip)
+                self.__logger.info('Device is offline: %s', ip)
+            sleep(self.__device_detection_interval)
 
     def __start_detect_device(self, daemon = False):
         if self.__device_detection_thread is None:
@@ -137,16 +137,17 @@ class SmartYeelight(object):
             thread = self.__device_detection_thread
             # set thread to None so that the loop can exit
             self.__device_detection_thread = None
-            thread.join(1)
+            thread.join(0.2)
             self.__logger.debug("Device detection thread stopped")
 
     def __stop_detect_device_worker(self):
         if self.__device_detection_thread_woker:
             self.__logger.debug("Stopping device detection worker thread..")
-        for ip in self.__device_detection_thread_woker:
+        for ip in list(self.__device_detection_thread_woker):
             self.__logger.debug("Stopping device detection worker thread for %s..", ip)
-            self.__device_detection_thread_woker[ip].join(1)
-        self.__device_detection_thread_woker.clear()
+            thread = self.__device_detection_thread_woker[ip]
+            self.__device_detection_thread_woker.pop(ip, None)
+            thread.join(0.2)
         self.__logger.debug("Device detection worker thread stopped")
 
     def __apply_light_policy_loop(self):
@@ -155,13 +156,15 @@ class SmartYeelight(object):
             sleep(self.__apply_light_policy_interval)
 
     def __apply_light_policy(self):
+        # update compiled policy
+        self.__get_compiled_policy(light_policy)
         # recalculate light brightness
         calculated_light_brigtness = self.calculate_light_brightness()
         change_applied = self.change_yeelight_brightness(calculated_light_brigtness)
-        if change_applied:
-            # if a change is a applied, we want to refresh the light status
-            # sometimes passively listening for light status change doesn't work
-            send_search_broadcast()
+        # if a change is a applied, we want to refresh the light status
+        # sometimes passively listening for light status change doesn't work
+        self.__logger.debug("Refreshing light status..")
+        send_search_broadcast()
 
     def __start_apply_light_policy(self, daemon = False):
         if self.__apply_light_policy_thread is None:
@@ -175,7 +178,7 @@ class SmartYeelight(object):
             thread = self.__apply_light_policy_thread
             # set thread to None so that the loop can exit
             self.__apply_light_policy_thread = None
-            thread.join(1)
+            thread.join(0.2)
             self.__logger.debug("Light policy executor thread stopped")
 
     def __get_overlap_between_lists(self, list1, list2):
@@ -443,7 +446,7 @@ if __name__ == "__main__":
             ]
         }
     ]
-    light = SmartYeelight(logging_level = logging.INFO)
+    light = SmartYeelight(logging_level = logging.DEBUG)
     light.deploy_policy(light_policy)
     light.start(daemon = True)
     while True:
