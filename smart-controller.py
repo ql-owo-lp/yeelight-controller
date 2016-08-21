@@ -5,10 +5,12 @@ import json
 import urllib2
 import math
 import sys, os
+import threading
 import signal
 import logging, logging.handlers
 from collections import Counter
 # sudo apt-get install python-dateutil
+import time
 from datetime import date, datetime
 from dateutil import tz
 import dateutil.parser
@@ -19,6 +21,8 @@ class SmartYeelight(object):
         self.__yeelight_detection_thread = None
         self.__device_detection_thread = None
         self.__device_detection_thread_woker = {}
+        self.__device_detection_thread_rlock = threading.Lock()
+        self.__thread_rlock = threading.Lock()
         self.__apply_light_policy_thread = None
         self.__current_geo = None
         self.__compiled_policy = []
@@ -40,7 +44,7 @@ class SmartYeelight(object):
         if logging_level is None:
             logging_level = logging.INFO
         rootLogger.setLevel(logging_level)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
         # create the logging file handler
         if log_file is not None:
             fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=1024 * 1024 * 5, backupCount=5)
@@ -52,6 +56,7 @@ class SmartYeelight(object):
         self.__logger = rootLogger
 
     def deploy_policy(self, light_policy):
+        self.__get_compiled_policy(light_policy, enforce_update = True)
         self.__logger.info("New policy loaded: %s", self.__compiled_policy)
 
     def load_config_file(self, config_file):
@@ -71,7 +76,7 @@ class SmartYeelight(object):
     def __start_yeelight(self, daemon = False):
         if self.__yeelight_detection_thread is None:
             RUNNING = True
-            self.__yeelight_detection_thread = Thread(target = bulbs_detection_loop)
+            self.__yeelight_detection_thread = Thread(name = 'YeelightThread', target = bulbs_detection_loop)
             self.__yeelight_detection_thread.setDaemon(daemon)
             self.__yeelight_detection_thread.start()
 
@@ -95,13 +100,15 @@ class SmartYeelight(object):
 
     def __detect_device_loop(self):
         while self.__device_detection_thread is not None:
-            for device_ip in self.__device_on_monitor:
-                if device_ip in self.__device_detection_thread_woker:
-                    continue
-                thread = Thread(target = self.__detect_device_worker, args = (device_ip, ))
-                self.__device_detection_thread_woker[device_ip] = thread
-                thread.setDaemon(True)
-                thread.start()
+            with self.__device_detection_thread_rlock:
+                for device_ip in self.__device_on_monitor:
+                    if device_ip in self.__device_detection_thread_woker:
+                        continue
+                    self.__logger.debug("Starting device detection worker thread for ip %s", device_ip)
+                    thread = Thread(name = 'DeviceDetectionWorkerThread', target = self.__detect_device_worker, args = (device_ip, ))
+                    self.__device_detection_thread_woker[device_ip] = thread
+                    thread.setDaemon(True)
+                    thread.start()
             sleep(self.__device_detection_interval)
 
     def __detect_device_worker(self, ip):
@@ -127,7 +134,7 @@ class SmartYeelight(object):
 
     def __start_detect_device(self, daemon = False):
         if self.__device_detection_thread is None:
-            self.__device_detection_thread = Thread(target = self.__detect_device_loop)
+            self.__device_detection_thread = Thread(name = 'DeviceDetectionThread', target = self.__detect_device_loop)
             self.__device_detection_thread.setDaemon(daemon)
             self.__device_detection_thread.start()
 
@@ -141,13 +148,14 @@ class SmartYeelight(object):
             self.__logger.debug("Device detection thread stopped")
 
     def __stop_detect_device_worker(self):
-        if self.__device_detection_thread_woker:
-            self.__logger.debug("Stopping device detection worker thread..")
-        for ip in list(self.__device_detection_thread_woker):
-            self.__logger.debug("Stopping device detection worker thread for %s..", ip)
-            thread = self.__device_detection_thread_woker[ip]
-            self.__device_detection_thread_woker.pop(ip, None)
-            thread.join(0.2)
+        with self.__device_detection_thread_rlock:
+            if self.__device_detection_thread_woker:
+                self.__logger.debug("Stopping device detection worker thread..")
+            for ip in list(self.__device_detection_thread_woker):
+                self.__logger.debug("Stopping device detection worker thread for %s..", ip)
+                thread = self.__device_detection_thread_woker[ip]
+                self.__device_detection_thread_woker.pop(ip, None)
+                thread.join(0.2)
         self.__logger.debug("Device detection worker thread stopped")
 
     def __apply_light_policy_loop(self):
@@ -163,12 +171,19 @@ class SmartYeelight(object):
         change_applied = self.change_yeelight_brightness(calculated_light_brigtness)
         # if a change is a applied, we want to refresh the light status
         # sometimes passively listening for light status change doesn't work
+        if change_applied:
+            self.__logger.info("Change applied")
+        else:
+            self.__logger.debug("No change is applied")
         self.__logger.debug("Refreshing light status..")
-        send_search_broadcast()
+        try:
+            send_search_broadcast()
+        except:
+            self.__logger.error("Error refreshing light status")
 
     def __start_apply_light_policy(self, daemon = False):
         if self.__apply_light_policy_thread is None:
-            self.__apply_light_policy_thread = Thread(target = self.__apply_light_policy_loop)
+            self.__apply_light_policy_thread = Thread(name = 'ApplyLightPolicyThread', target = self.__apply_light_policy_loop)
             self.__apply_light_policy_thread.setDaemon(daemon)
             self.__apply_light_policy_thread.start()
 
@@ -195,18 +210,20 @@ class SmartYeelight(object):
 
     def start(self, daemon = False):
         self.__logger.debug("Controller started")
-        self.__start_yeelight(daemon = daemon)
-        self.__start_detect_device(daemon = daemon)
-        self.__start_apply_light_policy(daemon = daemon)
-        self.__RUNNING = True
+        with self.__thread_rlock:
+            self.__start_yeelight(daemon = daemon)
+            self.__start_detect_device(daemon = daemon)
+            self.__start_apply_light_policy(daemon = daemon)
+            self.__RUNNING = True
 
     def stop(self, terminate_process = False):
         self.__logger.debug("Stopping Controller..")
-        self.__RUNNING = False
-        self.__stop_apply_light_policy()
-        self.__stop_detect_device()
-        self.__stop_detect_device_worker()
-        self.__stop_yeelight()
+        with self.__thread_rlock:
+            self.__RUNNING = False
+            self.__stop_apply_light_policy()
+            self.__stop_detect_device()
+            self.__stop_detect_device_worker()
+            self.__stop_yeelight()
         self.__logger.debug("Controller stopped")
         if terminate_process:
             try:
@@ -238,13 +255,18 @@ class SmartYeelight(object):
     def __get_datetime(self, iso_time):
         if id(type) and type(iso_time) in (datetime, date):
             return iso_time
+        elif isinstance(iso_time, int):
+            return datetime.fromtimestamp(iso_time)
         else:
             return dateutil.parser.parse(str(iso_time))
 
     def __get_localtime(self, iso_time, timezone = tz.tzlocal()):
-        iso_datetime = self.__get_datetime(iso_time)
-        local = iso_datetime.astimezone(timezone)
-        return local
+        d = self.__get_datetime(iso_time)
+        try:
+            d = d.astimezone(timezone) # aware object can be in any timezone
+        except ValueError: # naive
+            d = d.replace(tzinfo = timezone)
+        return d
 
     def __parse_time(self, time_string, current_time, format = '%H:%M:%S'):
         time  = datetime.strptime(time_string, format).replace(year = current_time.year, month = current_time.month, day = current_time.day, tzinfo = tz.tzlocal())
@@ -264,6 +286,28 @@ class SmartYeelight(object):
             self.__logger.info('Local policy cache updated: %s', self.__compiled_policy)
         return self.__compiled_policy
 
+    def __get_compiled_key(self, key):
+        return '$'+ key +'$'
+
+    def __compile_policy_value(self, str_value, value_dict):
+        value = str_value
+        if not '$' in value:
+            return value
+        self.__logger.debug("Compiling value %s", value)
+        for key in value_dict:
+            self.__logger.debug("Searching for key %s", key)
+            val = value_dict[key]
+            if id(type) and type(val) in (datetime, date):
+                self.__logger.debug("Value in dictionary: %s -> %s", key, val)
+                val = time.mktime(self.__get_localtime(val).timetuple())
+                self.__logger.debug("Timestamp converted: %s -> %s", key, val)
+            value = value.replace(self.__get_compiled_key(key), str(val))
+            self.__logger.debug("Value after convertsion: %s", value)
+        int_value = int(eval(value))
+        compiled_value = self.__get_localtime(int_value)
+        self.__logger.debug("Compiled value: %s", compiled_value)
+        return compiled_value
+
     def __compile_policy(self, light_policy, current_time):
         compiled_policy = []
         today = current_time.date()
@@ -279,8 +323,8 @@ class SmartYeelight(object):
                 compiled_light_policy = {}
                 # replace keywords with dynamic time
                 for key in policy:
-                    if isinstance(policy[key], basestring) and policy[key] in today_sun_time:
-                        compiled_light_policy[key] = today_sun_time[policy[key]]
+                    if isinstance(policy[key], basestring):
+                        compiled_light_policy[key] = self.__compile_policy_value(policy[key], today_sun_time)
                     else:
                         compiled_light_policy[key] = policy[key]
                 if 'bright_time' not in compiled_light_policy or 'dark_time' not in compiled_light_policy:
@@ -414,32 +458,32 @@ if __name__ == "__main__":
             "light_on_only_when_device_online" : [ "192.168.2.51", "192.168.2.53" ], # leave this empty if you want the policy be executed regardless if the device is online
             "policies" : [
                 {
-                    "bright_time" : "00:00:00",
-                    "dark_time" : "02:00:00",
+                    "dark_time" : "00:00:00",
+                    "bright_time" : "02:00:00",
                     "max_brightness" : 80,
                     "min_brightness" : 1,
                 },
                 {
                     "bright_time" : "02:00:00",
-                    "dark_time" : "sunrise",
+                    "dark_time" : "$sunrise$",
                     "const_brightness" : 0,
                 },
                 {
-                    "bright_time" : "sunrise",
-                    "dark_time" : "civil_twilight_begin",
+                    "bright_time" : "$sunrise$",
+                    "dark_time" : "$civil_twilight_begin$",
                     "const_brightness" : 0,
                 }, 
                 {
-                    "bright_time" : "civil_twilight_end",
-                    "dark_time" : "sunset",
+                    "bright_time" : "$civil_twilight_end$ - 3600",  # light on one hour earlier
+                    "dark_time" : "$sunset$",
                 },
                 {
-                    "bright_time" : "sunrise",
-                    "dark_time" : "sunset",
+                    "bright_time" : "$sunrise$",
+                    "dark_time" : "$sunset$",
                     "const_brightness" : 0
                 },
                 {
-                    "bright_time" : "civil_twilight_end",
+                    "bright_time" : "$civil_twilight_end$",
                     "dark_time" : "23:59:59",
                     "const_brightness" : 100
                 }
