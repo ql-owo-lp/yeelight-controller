@@ -203,7 +203,7 @@ class SmartYeelight(object):
         return overlap
 
     def __at_least_one_device_online(self, device_list):
-        if self.__get_overlap_between_lists(device_list, self.__device_online):
+        if len(device_list) > 0 and self.__get_overlap_between_lists(device_list, self.__device_online):
             return True
         else:
             return False
@@ -359,7 +359,7 @@ class SmartYeelight(object):
             return calculated_light_brigtness
         for bulb in compiled_policy:
             calculated_light = { "bulb_ip" : bulb["bulb_ip"] }
-            if bulb["light_on_only_when_device_online"] and not self.__at_least_one_device_online(bulb["light_on_only_when_device_online"]):
+            if 'light_on_only_when_device_online' in bulb and not self.__at_least_one_device_online(bulb["light_on_only_when_device_online"]):
                 # if required devices are not online, turn off the light
                 calculated_light["calculated_brightness"] = 0
             else:
@@ -455,16 +455,16 @@ if __name__ == "__main__":
     light_policy = [
         {
             "bulb_ip" : [ "192.168.2.31" ],
-            "light_on_only_when_device_online" : [ "192.168.2.51", "192.168.2.53" ], # leave this empty if you want the policy be executed regardless if the device is online
+            "light_on_only_when_device_online" : [  ], # value should be a list of ip string, leave this empty if you want the policy be executed regardless if the device is online
             "policies" : [
                 {
                     "dark_time" : "00:00:00",
-                    "bright_time" : "02:00:00",
-                    "max_brightness" : 80,
+                    "bright_time" : "01:30:00",
+                    "max_brightness" : 40,
                     "min_brightness" : 1,
                 },
                 {
-                    "bright_time" : "02:00:00",
+                    "bright_time" : "01:30:00",
                     "dark_time" : "$sunrise$",
                     "const_brightness" : 0,
                 },
@@ -472,7 +472,7 @@ if __name__ == "__main__":
                     "bright_time" : "$sunrise$",
                     "dark_time" : "$civil_twilight_begin$",
                     "const_brightness" : 0,
-                }, 
+                },
                 {
                     "bright_time" : "$civil_twilight_end$ - 3600",  # light on one hour earlier
                     "dark_time" : "$sunset$",
@@ -484,9 +484,15 @@ if __name__ == "__main__":
                 },
                 {
                     "bright_time" : "$civil_twilight_end$",
-                    "dark_time" : "23:59:59",
+                    "dark_time" : "23:00:00",
                     "const_brightness" : 100
-                }
+                },
+                {
+                    "dark_time" : "23:00:00",
+                    "bright_time" : "23:59:59",
+                    "max_brightness" : 100,
+                    "min_brightness" : 40,
+                },
             ]
         }
     ]
